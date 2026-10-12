@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Apply an iPhone 16-inspired photographic style to older HEIC/JPEG/PNG images.
+
+This script is intended as a stylized emulation layer, not a literal reverse
+engineering of Apple's private camera pipeline. It adds warm palette shaping,
+film-like saturation, subtle texture and grain, and a clean tonal ramp similar
+to newer iPhone camera interpretations.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+from typing import Iterable, List, Tuple
+
+import numpy as np
+from PIL import Image, ImageFilter, ImageOps
+
+try:
+    from pillow_heif import register_heif_opener
+except ImportError:  # pragma: no cover
+    register_heif_opener = None
+
+
+SUPPORTED_EXTENSIONS = {".heic", ".heif", ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+
+
+def clamp01(arr: np.ndarray) -> np.ndarray:
+    return np.clip(arr, 0.0, 1.0)
+
+
+def prepare_input_image(path: Path) -> Image.Image:
+    """Open images including HEIC via pillow-heif."""
+    if register_heif_opener is not None:
+        register_heif_opener()
+
+    image = Image.open(path)
+    if image.mode not in {"RGB", "RGBA", "L"}:
+        image = image.convert("RGB")
+    elif image.mode == "RGBA":
+        image = image.convert("RGB")
+    elif image.mode == "L":
+        image = image.convert("RGB")
+    return image.copy()
+
+
+def make_grain_map(shape: Tuple[int, int, int], strength: float, seed: int = 17) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    noise = rng.normal(0.0, 1.0, size=(shape[0], shape[1], 1)).astype(np.float32)
+    noise = np.tanh(noise * 0.8)
+    noise = (noise + 1.0) / 2.0
+    grain = np.repeat(noise, shape[2], axis=2)
+    return grain * strength
+
+
+def apply_warm_palette(rgb: np.ndarray, warmth: float) -> np.ndarray:
+    """Shift the tone toward a natural iPhone-looking warm neutral gradient."""
+    warm_vec = np.array([1.08, 1.04, 0.96], dtype=np.float32)
+    warm_bias = np.array([0.03, 0.02, -0.02], dtype=np.float32)
+
+    rgb = rgb.copy()
+    rgb = rgb * (1.0 + warmth * (warm_vec - 1.0))
+    rgb = rgb + warm_bias * (0.7 + warmth)
+    return clamp01(rgb)
+
+
+def apply_vibrance(rgb: np.ndarray, saturation: float) -> np.ndarray:
+    """Increase perceived saturation without overshooting skin tones."""
+    if saturation <= 1.0:
+        return rgb
+
+    luma = 0.2126 * rgb[:, :, 0] + 0.7152 * rgb[:, :, 1] + 0.0722 * rgb[:, :, 2]
+    luma = luma[:, :, None]
+    adjusted = luma + (rgb - luma) * saturation
+    return clamp01(adjusted)
+
+
+def apply_contrast(rgb: np.ndarray, contrast: float) -> np.ndarray:
+    if contrast == 1.0:
+        return rgb
+    return clamp01((rgb - 0.5) * contrast + 0.5)
+
+
+def apply_highlight_rolloff(rgb: np.ndarray, toning: float) -> np.ndarray:
+    """Gentle highlight compression to mimic modern HDR-ish tones."""
+    highlights = np.clip((rgb - 0.75) / 0.25, 0.0, 1.0)
+    rgb = rgb - highlights * toning * 0.18
+    return clamp01(rgb)
+
+
+def add_texture_and_grain(rgb: np.ndarray, texture: float, grain: float, seed: int = 42) -> np.ndarray:
+    if texture <= 0.0 and grain <= 0.0:
+        return rgb
+
+    h, w, c = rgb.shape
+    base = rgb.copy()
+
+    if texture > 0.0:
+        # Generate a soft sheened texture pattern via a low-frequency noise map.
+        texture_noise = make_grain_map((h, w, c), strength=texture * 0.65, seed=seed)
+        base = base + (texture_noise - 0.5) * 0.25
+
+    if grain > 0.0:
+        grain_noise = make_grain_map((h, w, c), strength=grain, seed=seed + 19)
+        # Keep grain in the midtones to avoid harsh crushing of highlights/shadows.
+        luminance = 0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]
+        luminance = luminance[:, :, None]
+        mask = 1.0 - np.abs(luminance - 0.5) * 2.0
+        mask = np.clip(mask, 0.0, 1.0)
+        base = base + grain_noise * mask * 0.75
+
+    return clamp01(base)
+
+
+def style_image(image: Image.Image, warmth: float = 0.35, saturation: float = 1.18, contrast: float = 1.18, texture: float = 0.32, grain: float = 0.22) -> Image.Image:
+    rgb = np.asarray(image, dtype=np.float32) / 255.0
+    rgb = apply_warm_palette(rgb, warmth)
+    rgb = apply_vibrance(rgb, saturation)
+    rgb = apply_contrast(rgb, contrast)
+    rgb = apply_highlight_rolloff(rgb, toning=0.8)
+    rgb = add_texture_and_grain(rgb, texture, grain)
+    rgb = clamp01(rgb)
+    return Image.fromarray(np.uint8(rgb * 255.0), mode="RGB")
+
+
+def list_image_files(path: Path, recursive: bool = False) -> List[Path]:
+    if path.is_file():
+        return [path] if path.suffix.lower() in SUPPORTED_EXTENSIONS else []
+
+    pattern = "**/*" if recursive else "*"
+    paths = []
+    for child in path.glob(pattern):
+        if child.is_file() and child.suffix.lower() in SUPPORTED_EXTENSIONS:
+            paths.append(child)
+    return sorted(paths)
+
+
+def ensure_output_dir(path: Path) -> None:
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def process_file(input_path: Path, output_path: Path, args: argparse.Namespace) -> None:
+    image = prepare_input_image(input_path)
+    if args.preserve_original_size:
+        processed = style_image(image, warmth=args.warmth, saturation=args.saturation, contrast=args.contrast, texture=args.texture, grain=args.grain)
+    else:
+        processed = style_image(image, warmth=args.warmth, saturation=args.saturation, contrast=args.contrast, texture=args.texture, grain=args.grain)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    processed.save(output_path)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Apply an iPhone 16-inspired photography style to older photos.")
+    parser.add_argument("input", type=Path, help="Input image file or directory")
+    parser.add_argument("output", type=Path, help="Output file or directory")
+    parser.add_argument("--warmth", type=float, default=0.35, help="Warm tone bias (0.0-1.0)")
+    parser.add_argument("--saturation", type=float, default=1.18, help="Color saturation multiplier")
+    parser.add_argument("--contrast", type=float, default=1.18, help="Contrast multiplier")
+    parser.add_argument("--texture", type=float, default=0.32, help="Texture strength (0.0-0.6)")
+    parser.add_argument("--grain", type=float, default=0.22, help="Grain strength (0.0-0.4)")
+    parser.add_argument("--recursive", action="store_true", help="Recursively process a directory")
+    parser.add_argument("--preserve-original-size", action="store_true", help="Keep original image size")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    if args.input.is_file():
+        if args.input.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            print(f"Unsupported input type: {args.input.suffix}", file=sys.stderr)
+            return 1
+
+        out_path = args.output
+        process_file(args.input, out_path, args)
+        print(f"Processed: {args.input} -> {out_path}")
+        return 0
+
+    files = list_image_files(args.input, recursive=args.recursive)
+    if not files:
+        print(f"No supported image files found in {args.input}", file=sys.stderr)
+        return 1
+
+    ensure_output_dir(args.output)
+    for file in files:
+        relative = file.relative_to(args.input)
+        dest = args.output / relative
+        if file.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".heic", ".heif"}:
+            # Keep extension for output file, while generating a visible image.
+            dest = dest.with_suffix(".jpg") if dest.suffix.lower() not in {".jpg", ".jpeg"} else dest
+            process_file(file, dest, args)
+            print(f"Processed: {file} -> {dest}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
